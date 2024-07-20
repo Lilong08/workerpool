@@ -2,6 +2,7 @@ package workerpool
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,17 +43,38 @@ func New(maxWorkers int) *WorkerPool {
 // WorkerPool is a collection of goroutines, where the number of concurrent
 // goroutines processing requests does not exceed the specified maximum.
 type WorkerPool struct {
-	maxWorkers   int
-	taskQueue    chan func()
-	workerQueue  chan func()
-	stoppedChan  chan struct{}
-	stopSignal   chan struct{}
+	maxWorkers int
+
+	// 任务队列
+	// submit将任务提交至taskQueue
+	taskQueue chan func()
+
+	// worker队列
+	// 无缓冲通道
+	workerQueue chan func()
+
+	// 用于同步stop()和dispatch()
+	stoppedChan chan struct{}
+
+	// workerpool停止信号
+	stopSignal chan struct{}
+
+	// 等待任务队列
 	waitingQueue deque.Deque[func()]
-	stopLock     sync.Mutex
-	stopOnce     sync.Once
-	stopped      bool
-	waiting      int32
-	wait         bool
+
+	stopLock sync.Mutex
+
+	// 保证退出操作只有一次
+	stopOnce sync.Once
+
+	// 受到stopLock的保护
+	stopped bool
+
+	// 池中等待执行的task的数量
+	waiting int32
+
+	// stop时,是否等待所有任务执行完成
+	wait bool
 }
 
 // Size returns the maximum number of concurrent workers.
@@ -161,12 +183,15 @@ func (p *WorkerPool) Pause(ctx context.Context) {
 	ready.Wait()
 }
 
+// 从队列中取出任务分发给一个可用的worker
 // dispatch sends the next queued task to an available worker.
 func (p *WorkerPool) dispatch() {
 	defer close(p.stoppedChan)
 	timeout := time.NewTimer(idleTimeout)
 	var workerCount int
 	var idle bool
+
+	// 用于同步多个worker的完成
 	var wg sync.WaitGroup
 
 Loop:
@@ -175,6 +200,8 @@ Loop:
 		// into the waiting queue and tasks to run are taken from the waiting
 		// queue. Once the waiting queue is empty, then go back to submitting
 		// incoming tasks directly to available workers.
+		// 如果等待执行队列不为空
+		// taskQueue中的task放入waitingQueue中等待处理
 		if p.waitingQueue.Len() != 0 {
 			if !p.processWaitingQueue() {
 				break Loop
@@ -182,6 +209,7 @@ Loop:
 			continue
 		}
 
+		// 当前waitingQueue中没有task
 		select {
 		case task, ok := <-p.taskQueue:
 			if !ok {
@@ -189,8 +217,17 @@ Loop:
 			}
 			// Got a task to do.
 			select {
+			// 接收到第一个任务时，由于没有goroutine去从
+			// p.workerQueue中读取数据
+			// 第一个case不执行
+			// 执行default case:
+			// go worker(task, p.workerQueue, &wg)该goroutine中
+			// 会尝试从p.workerQueue中读取数据
+			// 因此, 第二个task到达时, 第一个case可以被执行
 			case p.workerQueue <- task:
+				fmt.Println(task, "is put into workerqueue!")
 			default:
+				fmt.Println(task, "a new worker to exe the task!")
 				// Create a new worker, if not at max.
 				if workerCount < p.maxWorkers {
 					wg.Add(1)
@@ -233,6 +270,10 @@ Loop:
 
 // worker executes tasks and stops when it receives a nil task.
 func worker(task func(), workerQueue chan func(), wg *sync.WaitGroup) {
+	// 新生成的worker goroutine会先执行task
+	// 然后从workerQueue中获取任务进行执行
+	// 多个worker goroutine会阻塞在通道的读取操作
+	// 有任务来到时, 其中一个会读取然后执行
 	for task != nil {
 		task()
 		task = <-workerQueue
@@ -242,6 +283,7 @@ func worker(task func(), workerQueue chan func(), wg *sync.WaitGroup) {
 
 // stop tells the dispatcher to exit, and whether or not to complete queued
 // tasks.
+// wait用于dispatcher退出时,是否等待所有的task完成
 func (p *WorkerPool) stop(wait bool) {
 	p.stopOnce.Do(func() {
 		// Signal that workerpool is stopping, to unpause any paused workers.
@@ -256,8 +298,12 @@ func (p *WorkerPool) stop(wait bool) {
 		p.stopLock.Unlock()
 		p.wait = wait
 		// Close task queue and wait for currently running tasks to finish.
+		// dispatcher再去读取taskQueue时返回false, 从而退出
 		close(p.taskQueue)
 	})
+
+	// 等待dispatcher完成所有操作退出
+	// dispatcher退出时关闭stoppedChan
 	<-p.stoppedChan
 }
 
@@ -271,6 +317,9 @@ func (p *WorkerPool) processWaitingQueue() bool {
 			return false
 		}
 		p.waitingQueue.PushBack(task)
+	// waitingQueue中的task会被放入workQueue中
+	// 如果有worker 阻塞的话
+	// worker处理相应任务
 	case p.workerQueue <- p.waitingQueue.Front():
 		// A worker was ready, so gave task to worker.
 		p.waitingQueue.PopFront()
