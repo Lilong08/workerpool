@@ -274,6 +274,7 @@ func worker(task func(), workerQueue chan func(), wg *sync.WaitGroup) {
 	// 然后从workerQueue中获取任务进行执行
 	// 多个worker goroutine会阻塞在通道的读取操作
 	// 有任务来到时, 其中一个会读取然后执行
+	fmt.Println("in a worker!")
 	for task != nil {
 		fmt.Println("exe the task  ", task)
 		task()
